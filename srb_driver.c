@@ -524,6 +524,7 @@ static int srb_init_disk(struct srb_device_s *dev)
 	}
 
 	blk_queue_max_hw_sectors(q, DEV_NB_PHYS_SEGS);
+        queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
 	q->queuedata	= dev;
 
 	dev->disk	= disk;
