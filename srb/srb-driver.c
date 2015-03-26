@@ -21,24 +21,27 @@
 // Linux Kernel/LKM headers: module.h is needed by all modules and
 // kernel.h is needed for KERN_INFO.
 
-#include <linux/module.h>    // included for all kernel modules
-#include <linux/kernel.h>    // included for KERN_INFO
-#include <linux/moduleparam.h>	// included for LKM parameters
-#include <linux/init.h>      // included for __init and __exit macros
-#include <linux/device.h>
-#include <linux/spinlock.h>
-#include <linux/wait.h>
-#include <linux/mutex.h>
-#include <linux/fs.h>
 #include <linux/blkdev.h>
-#include <linux/slab.h>
-#include <linux/vmalloc.h> // for vmalloc()
 #include <linux/kthread.h>
+#include <linux/module.h>
 #include <linux/version.h>
-#include <linux/string.h>
+
+#include <srb/srb-cdmi.h>
+#include <srb/srb-log.h>
 
 #include "srb.h"
 
+#define DEV_MAX			64
+#define DEV_MINORS		256
+
+/*
+ * Default values for ScalityRestBlock LKM parameters
+ */
+#define SRB_REQ_TIMEOUT_DFLT		30
+#define SRB_NB_REQ_RETRIES_DFLT	3
+#define SRB_CONN_TIMEOUT_DFLT		30
+#define SRB_LOG_LEVEL_DFLT		SRB_INFO
+#define SRB_THREAD_POOL_SIZE_DFLT	8
 
 // LKM information
 MODULE_AUTHOR("Laurent Meyer <laurent.meyer@digitam.net>");
@@ -46,6 +49,78 @@ MODULE_AUTHOR("David Pineau <david.pineau@scality.com>");
 MODULE_DESCRIPTION("Block Device Driver for REST-based storage");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DEV_REL_VERSION);
+
+typedef struct srb_server_s {
+	struct srb_server_s   	*next;
+	struct srb_cdmi_desc	cdmi_desc;
+} srb_server_t;
+
+/* Device state (reduce spinlock section and avoid multiple operation on same device) */
+enum device_state {
+        DEV_IN_USE,
+        DEV_UNUSED,
+};
+
+struct srb_device {
+	/* Device subsystem related data */
+	int			id;		/* device ID */
+	int			major;		/* blkdev assigned major */
+
+	/* NOTE: use const from ./linux/genhd.h */
+	char			name[DISK_NAME_LEN];	/* blkdev name, e.g. srba */
+	struct gendisk		*disk;
+	uint64_t		disk_size;	/* Size in bytes */
+	atomic_t                users;		/* Number of users who
+						 * opened dev */
+	enum device_state			state; 		/* for create extend attach detach destroy purpose */
+
+	struct request_queue	*q;
+	spinlock_t		rq_lock;	/* request queue lock */
+
+	struct task_struct	**thread;	/* allow dynamic allocation during device creation */
+	int			nb_threads;
+
+	/* Dewpoint specific data */
+	struct srb_cdmi_desc	 **thread_cdmi_desc;	/* allow dynamic allocation during device creation*/
+
+	/*
+	** List of requests received by the drivers, but still to be
+	** processed. This due to network latency.
+	*/
+	spinlock_t		waiting_lock;	/* wait_queue lock */
+	wait_queue_head_t	waiting_wq;
+	struct list_head	waiting_queue;  /* Requests to be sent */
+
+	/* Debug traces */
+	srb_debug_t		debug;
+};
+
+const srb_debug_t * srb_device_get_debug(const struct srb_device *dev) {
+        return &dev->debug;
+}
+
+int srb_device_get_major(const struct srb_device *dev) {
+        return dev->major;
+}
+
+const char * srb_device_get_name(const struct srb_device *dev) {
+        return dev->name;
+}
+
+int srb_device_get_debug_level(const struct srb_device *dev) {
+        return dev->debug.level;
+}
+void srb_device_set_debug_level(struct srb_device *dev, int level) {
+        dev->debug.level = level;
+}
+
+struct srb_cdmi_desc * srb_device_get_thread_cdmi_desc(const struct srb_device *dev, int idx) {
+        return dev->thread_cdmi_desc[idx];
+}
+
+struct gendisk * srb_device_get_disk(const struct srb_device *dev) {
+        return dev->disk;
+}
 
 static srb_device_t	devtab[DEV_MAX];
 static srb_server_t	*servers = NULL;
@@ -256,8 +331,8 @@ static int req_flags_to_str(int flags, char *buff)
 /*
  * Handle an I/O request.
  */
-static int srb_xfer_scl(struct srb_device_s *dev,
-		struct srb_cdmi_desc_s *desc,
+static int srb_xfer_scl(struct srb_device *dev,
+		struct srb_cdmi_desc *desc,
 		struct request *req)
 {
 	int ret = 0;
@@ -302,7 +377,7 @@ static int srb_xfer_scl(struct srb_device_s *dev,
 /*
  * Free internal disk
  */
-static int srb_free_disk(struct srb_device_s *dev)
+static int srb_free_disk(struct srb_device *dev)
 {
 	struct gendisk *disk = NULL;
 
@@ -330,7 +405,7 @@ static int srb_free_disk(struct srb_device_s *dev)
  */
 static int srb_thread(void *data)
 {
-	struct srb_device_s *dev;
+	struct srb_device *dev;
 	struct request *req;
 	unsigned long flags;
 	int th_id;
@@ -342,9 +417,9 @@ static int srb_thread(void *data)
 #else
 	struct bio_vec bvec;
 #endif
-	struct srb_cdmi_desc_s *cdmi_desc;
+	struct srb_cdmi_desc *cdmi_desc;
 
-	SRBDEV_LOG_DEBUG(((struct srb_device_s *)data), "Thread started with device %p", data);
+	SRBDEV_LOG_DEBUG(((struct srb_device *)data), "Thread started with device %p", data);
 
 	dev = data;
 
@@ -401,8 +476,8 @@ static int srb_thread(void *data)
 		}
 
 		/* Create scatterlist */
-		cdmi_desc = dev->thread_cdmi_desc[th_id];
-		sg_init_table(dev->thread_cdmi_desc[th_id]->sgl, DEV_NB_PHYS_SEGS);
+		cdmi_desc = srb_device_get_thread_cdmi_desc(dev, th_id);
+		sg_init_table(cdmi_desc->sgl, DEV_NB_PHYS_SEGS);
 		dev->thread_cdmi_desc[th_id]->sgl_size = blk_rq_map_sg(dev->q, req, dev->thread_cdmi_desc[th_id]->sgl);
 
 		SRBDEV_LOG_DEBUG(dev, "scatter_list size %d [nb_seg = %d,"
@@ -428,7 +503,7 @@ static int srb_thread(void *data)
 
 static void srb_rq_fn(struct request_queue *q)
 {
-	struct srb_device_s *dev = q->queuedata;	
+	struct srb_device *dev = q->queuedata;	
 	struct request *req;
 	unsigned long flags;
 
@@ -465,7 +540,7 @@ static int srb_open(struct block_device *bdev, fmode_t mode)
 	      goto out;
 	}
 
-	dev->users++;
+        atomic_inc(&dev->users);
  out:
 	spin_unlock(&devtab_lock);
 	return ret;
@@ -482,7 +557,7 @@ static void srb_release(struct gendisk *disk, fmode_t mode)
 	dev = disk->private_data;
 	SRBDEV_LOG_INFO(dev, "Releasing device (%s)", disk->disk_name);
 	spin_lock(&devtab_lock);
-	dev->users--;
+        atomic_dec(&dev->users);
 	spin_unlock(&devtab_lock);
 }
 
@@ -493,11 +568,11 @@ static const struct block_device_operations srb_fops =
 	.release =	srb_release,
 };
 
-static int srb_init_disk(struct srb_device_s *dev)
+static int srb_init_disk(struct srb_device *dev)
 {
 	struct gendisk *disk = NULL;
 	struct request_queue *q;
-	int i;
+	unsigned int i;
 	int ret = 0;
 
 	SRB_LOG_INFO(srb_log, "srb_init_disk: initializing disk for device: %s", dev->name);
@@ -594,7 +669,7 @@ err_kthread:
 static int srb_device_new(const char *devname, srb_device_t *dev)
 {
 	int ret = -EINVAL;
-	int i;
+	unsigned int i;
 
 	SRB_LOG_INFO(srb_log, "srb_device_new: creating new device %s"
 		      " with %d threads", devname, thread_pool_size);
@@ -617,7 +692,7 @@ static int srb_device_new(const char *devname, srb_device_t *dev)
 	 */
 	dev->debug.name = &dev->name[0];
 	dev->debug.level = srb_log;
-	dev->users = 0;
+        atomic_set(&dev->users, 0);
 	strncpy(dev->name, devname, strlen(devname));
 
 	/* XXX: dynamic allocation of thread pool and cdmi connection pool
@@ -632,7 +707,7 @@ static int srb_device_new(const char *devname, srb_device_t *dev)
 		goto err_mem;
 	}
 	for (i = 0; i < thread_pool_size; i++) {
-	    dev->thread_cdmi_desc[i] = vmalloc(sizeof(struct srb_cdmi_desc_s));
+	    dev->thread_cdmi_desc[i] = vmalloc(sizeof(struct srb_cdmi_desc));
 		if (dev->thread_cdmi_desc[i] == NULL) {
 			SRB_LOG_CRIT(srb_log, "srb_device_new: Unable to allocate memory for CDMI struct, step %d", i);
 			ret = -ENOMEM;
@@ -674,7 +749,7 @@ static void __srb_device_free(srb_device_t *dev)
 
 static void srb_device_free(srb_device_t *dev)
 {
-	int i = 0;
+	unsigned int i = 0;
 
 	SRB_LOG_INFO(srb_log, "srb_device_free: freeing device: %s", dev->name);
 
@@ -712,16 +787,16 @@ static int _srb_reconstruct_url(char *url, char *name,
 
 	if (seplen)
 	{
-		urllen = snprintf(url, SRB_URL_SIZE, "%s/%s", baseurl, filename);
-		namelen = snprintf(name, SRB_URL_SIZE, "%s/%s", basepath, filename);
+		urllen = snprintf(url, SRB_CDMI_URL_SIZE, "%s/%s", baseurl, filename);
+		namelen = snprintf(name, SRB_CDMI_URL_SIZE, "%s/%s", basepath, filename);
 	}
 	else
 	{
-		urllen = snprintf(url, SRB_URL_SIZE, "%s%s", baseurl, filename);
-		namelen = snprintf(name, SRB_URL_SIZE, "%s%s", basepath, filename);
+		urllen = snprintf(url, SRB_CDMI_URL_SIZE, "%s%s", baseurl, filename);
+		namelen = snprintf(name, SRB_CDMI_URL_SIZE, "%s%s", basepath, filename);
 	}
 
-	if (urllen >= SRB_URL_SIZE || namelen >= SRB_URL_SIZE)
+	if (urllen >= SRB_CDMI_URL_SIZE || namelen >= SRB_CDMI_URL_SIZE)
 		return -EINVAL;
 
 	return 0;
@@ -729,7 +804,7 @@ static int _srb_reconstruct_url(char *url, char *name,
 
 static int __srb_device_detach(srb_device_t *dev)
 {
-	int i;
+	unsigned int i, users = 0;
 	int ret = 0;
 
 	SRB_LOG_DEBUG(srb_log, "detaching device (%p)", dev);
@@ -741,8 +816,9 @@ static int __srb_device_detach(srb_device_t *dev)
 
 	SRBDEV_LOG_DEBUG(dev, "Detaching device (%s)", dev->name);
 
-	if (dev->users > 0) {
-		SRBDEV_LOG_ERR(dev, "Unable to remove, device still opened (#users: %d)", dev->users);
+        users = atomic_read(&dev->users);
+	if (users > 0) {
+		SRBDEV_LOG_ERR(dev, "Unable to remove, device still opened (#users: %d)", users);
 		return -EBUSY;
 	}
 
@@ -878,10 +954,10 @@ end:
  * XXX NOTE XXX: #13 This function picks only one server that has enough free
  * space in the URL buffer to append the filename.
  */
-static int _srb_server_pick(const char *filename, struct srb_cdmi_desc_s *pick)
+static int _srb_server_pick(const char *filename, struct srb_cdmi_desc *pick)
 {
-	char url[SRB_URL_SIZE];
-	char name[SRB_URL_SIZE];
+	char url[SRB_CDMI_URL_SIZE];
+	char name[SRB_CDMI_URL_SIZE];
 	int ret;
 	int found = 0;
 	srb_server_t *server = NULL;
@@ -898,9 +974,9 @@ static int _srb_server_pick(const char *filename, struct srb_cdmi_desc_s *pick)
 					    filename);
 		SRB_LOG_INFO(srb_log, "Dewb reconstruct url yielded %s, %i", url, ret);
 		if (ret == 0) {
-			memcpy(pick, &server->cdmi_desc, sizeof(struct srb_cdmi_desc_s));
-			strncpy(pick->url, url, SRB_URL_SIZE);
-			strncpy(pick->filename, name, SRB_URL_SIZE);
+			memcpy(pick, &server->cdmi_desc, sizeof(struct srb_cdmi_desc));
+			strncpy(pick->url, url, SRB_CDMI_URL_SIZE);
+			strncpy(pick->filename, name, SRB_CDMI_URL_SIZE);
 			SRB_LOG_INFO(srb_log, "Copied into pick: url=%s, name=%s", pick->url, pick->filename);
 			found = 1;
 			break ;
@@ -941,7 +1017,7 @@ int srb_server_add(const char *url)
 	debug.name = "<Server-Url-Adder>";
 	debug.level = srb_log;
 
-	if (strlen(url) >= SRB_URL_SIZE) {
+	if (strlen(url) >= SRB_CDMI_URL_SIZE) {
 		SRB_LOG_ERR(srb_log, "Url too big: '%s'", url);
 		ret = -EINVAL;
 		goto err_out_dev;
@@ -1039,7 +1115,7 @@ int srb_server_remove(const char *url)
 
 	SRB_LOG_INFO(srb_log, "srb_server_remove: removing server %s", url);
 
-	if (strlen(url) >= SRB_URL_SIZE) {
+	if (strlen(url) >= SRB_CDMI_URL_SIZE) {
 		SRB_LOG_ERR(srb_log, "Url too big: '%s'", url);
 		ret = -EINVAL;
 		goto end;
@@ -1097,98 +1173,12 @@ ssize_t srb_servers_dump(char *buf, ssize_t max_size)
 	return ret < 0 ? ret : printed;
 }
 
-struct cdmi_volume_list_data {
-	char	*buf;
-	size_t	max_size;
-	size_t	printed;
-};
-static int _srb_volume_dump(struct cdmi_volume_list_data *cb_data, const char *volname)
-{
-	int ret;
-	int len;
-
-	SRB_LOG_DEBUG(srb_log, "Adding volume %s to listing", volname);
-	if (cb_data->printed + strlen(volname) + 1 < cb_data->max_size)
-	{
-		len = snprintf(cb_data->buf + cb_data->printed,
-			       cb_data->max_size - cb_data->printed,
-			       "%s\n", volname);
-		if (len == -1
-		    || len > cb_data->max_size - cb_data->printed) {
-			SRB_LOG_ERR(srb_log, "Not enough space to print"
-				     " volume list in buffer.");
-			ret = -ENOMEM;
-			goto end;
-		}
-		cb_data->printed += len;
-	}
-
-	ret = 0;
-
-end:
-	return ret;
-}
-
-int srb_volumes_dump(char *buf, size_t max_size)
-{
-	int			ret = 0;
-	int			connected = 0;
-	struct srb_cdmi_desc_s *cdmi_desc;
-	struct cdmi_volume_list_data cb_data = { buf, max_size, 0};
-	srb_debug_t debug;
-
-	SRB_LOG_INFO(srb_log, "srb_volumes_dump: dumping volumes: buf: %p, max_size: %ld", buf, max_size);
-
-	cdmi_desc = vmalloc(sizeof(*cdmi_desc));
-	if (cdmi_desc == NULL) {
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	/* Find server for directory (filename must be empty, not NULL) */
-	ret = _srb_server_pick("", cdmi_desc);
-	if (ret != 0) {
-		SRB_LOG_ERR(srb_log, "Unable to get server: %i", ret);
-		goto cleanup;
-	}
-	SRB_LOG_INFO(srb_log, "Dumping volumes: Picked server "
-		      "[ip=%s port=%d fullpath=%s]",
-		      cdmi_desc->ip_addr, cdmi_desc->port,
-		      cdmi_desc->filename);
-
-	/* Inherit log level from srb LKM */
-	debug.name = "<Volumes Dumper>";
-	debug.level = srb_log;
-
-	ret = srb_cdmi_connect(&debug, cdmi_desc);
-	if (ret != 0)
-		goto cleanup;
-	connected = 1;
-
-	ret = srb_cdmi_list(&debug, cdmi_desc,
-			     (srb_cdmi_list_cb)_srb_volume_dump, (void*)&cb_data);
-	if (ret != 0)
-		goto cleanup;
-
-	ret = 0;
-
-cleanup:
-	if (NULL != cdmi_desc)
-	{
-		if (connected)
-			srb_cdmi_disconnect(&debug, cdmi_desc);
-		vfree(cdmi_desc);
-	}
-
-	return ret < 0 ? ret : cb_data.printed;
-}
-
 int srb_device_detach(const char *devname)
 {
 	int ret = 0;
 	int i;
 	int found = 0;
-	struct srb_device_s *dev = NULL;
+	struct srb_device *dev = NULL;
 
 	SRB_LOG_INFO(srb_log, "srb_device_detach: detaching device name %s",
 		      devname);
@@ -1200,7 +1190,7 @@ int srb_device_detach(const char *devname)
 			if (strcmp(devname, devtab[i].name) == 0) {
 				found = 1;
 				dev = &devtab[i];
-				if (devtab[i].users > 0)
+				if (atomic_read(&devtab[i].users) > 0)
 				        ret = -EBUSY;
 				else if (devtab[i].state == DEV_IN_USE) {
 					ret = -EBUSY;
@@ -1246,9 +1236,9 @@ int srb_device_attach(const char *filename, const char *devname)
 {
 	srb_device_t *dev = NULL;
 	int rc = 0;
-	int i;
+	unsigned int i;
 	int do_unregister = 0;
-	struct srb_cdmi_desc_s *cdmi_desc = NULL;
+	struct srb_cdmi_desc *cdmi_desc = NULL;
 	int found = 0;
 	const char *fname;
 
@@ -1298,7 +1288,7 @@ int srb_device_attach(const char *filename, const char *devname)
 
 	SRB_LOG_INFO(srb_log, "Volume %s not attached yet, using device slot %d", filename, dev->id);
 
-	cdmi_desc = vmalloc(sizeof(struct srb_cdmi_desc_s));
+	cdmi_desc = vmalloc(sizeof(struct srb_cdmi_desc));
 	if (cdmi_desc == NULL) {
 		SRB_LOG_ERR(srb_log, "Unable to allocate memory for cdmi struct");
 		rc = -ENOMEM;
@@ -1338,7 +1328,7 @@ int srb_device_attach(const char *filename, const char *devname)
 
 	for (i = 0; i < thread_pool_size; i++) {	
 		memcpy(dev->thread_cdmi_desc[i], cdmi_desc,
-		       sizeof(struct srb_cdmi_desc_s));
+		       sizeof(struct srb_cdmi_desc));
 	}
 	rc = register_blkdev(0, DEV_NAME);
 	if (rc < 0) {
@@ -1386,216 +1376,6 @@ cleanup:
 
 	if (rc < 0)
 		SRB_LOG_ERR(srb_log, "Error adding device %s", filename);
-
-	return rc;
-}
-
-int srb_device_create(const char *filename, unsigned long long size)
-{
-	srb_debug_t debug;
-	struct srb_cdmi_desc_s *cdmi_desc;
-	int rc;
-
-	SRB_LOG_INFO(srb_log, "srb_device_create: creating volume %s of size %llu", filename, size);
-
-	debug.name = NULL;
-	debug.level = srb_log;
-
-	cdmi_desc = vmalloc(sizeof(struct srb_cdmi_desc_s));
-	if (cdmi_desc == NULL) {
-		rc = -ENOMEM;
-		goto err_out_mod;
-	}
-
-	/* Now, setup a cdmi connection then Truncate(create) the file. */
-	rc = _srb_server_pick(filename, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_connect(&debug, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_create(&debug, cdmi_desc, size);
-	if (rc != 0)
-		goto err_out_cdmi;
-
-	srb_cdmi_disconnect(&debug, cdmi_desc);
-
-	SRB_LOG_INFO(srb_log, "Created volume with filename %s", filename);
-
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-
-	return rc;
-
-err_out_cdmi:
-	srb_cdmi_disconnect(&debug, cdmi_desc);
-err_out_alloc:
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-err_out_mod:
-	SRB_LOG_ERR(srb_log, "Error creating volume %s", filename);
-
-	return rc;
-}
-
-int srb_device_extend(const char *filename, unsigned long long size)
-{
-	srb_debug_t debug;
-	struct srb_cdmi_desc_s *cdmi_desc = NULL;
-	int i;
-	int rc = 0;
-	struct srb_device_s *dev = NULL;
-
-	SRB_LOG_INFO(srb_log, "srb_device_extend: extending volume %s to %llu size", filename, size);
-
-	debug.name = NULL;
-	debug.level = srb_log;
-
-	/* check if volume is already attached, otherwise use the first empty slot */
-	spin_lock(&devtab_lock);
-	for (i = 0; i < DEV_MAX; ++i) {
-		if (!device_free_slot(&devtab[i])) {
-			const char *fname = kbasename(devtab[i].thread_cdmi_desc[0]->filename);
-			if (strlen(fname) == strlen(filename) && strncmp(fname, filename, strlen(filename)) == 0) {
-				dev = &devtab[i];
-				if (dev->state == DEV_IN_USE)
-					rc = -EBUSY;
-				else
-					dev->state = DEV_IN_USE;
-				break;
-			}
-		}
-	}
-	spin_unlock(&devtab_lock);
-	if (0 != rc) {
-		SRBDEV_LOG_ERR(dev, "Cannot extend volume %s: attached on device in use (%s)", filename, dev->name);
-		dev = NULL;
-		return rc;
-	}
-
-	cdmi_desc = vmalloc(sizeof(struct srb_cdmi_desc_s));
-	if (cdmi_desc == NULL) {
-		rc = -ENOMEM;
-		goto err_out_mod;
-	}
-	memset(cdmi_desc, 0, sizeof(struct srb_cdmi_desc_s));
-
-	/* Now, setup a cdmi connection then Truncate(create) the file. */
-	rc = _srb_server_pick(filename, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_connect(&debug, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_extend(&debug, cdmi_desc, size);
-	if (rc != 0)
-		goto err_out_cdmi;
-
-	rc = srb_cdmi_disconnect(&debug, cdmi_desc);
-	if (rc != 0)
-		goto err_out_cdmi;
-
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-
-	// Find device (normally only 1) associated to filename and update their size
-	spin_lock(&devtab_lock);
-	if (dev) {
-		devtab[i].disk_size = size;
-		set_capacity(devtab[i].disk, devtab[i].disk_size / 512ULL);
-		revalidate_disk(devtab[i].disk);
-		dev->state = DEV_UNUSED;
-	}
-	spin_unlock(&devtab_lock);
-
-	SRB_LOG_INFO(srb_log, "Extended filename %s", filename);
-
-	return rc;
-
-err_out_cdmi:
-	srb_cdmi_disconnect(&debug, cdmi_desc);
-err_out_alloc:
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-err_out_mod:
-	SRB_LOG_ERR(srb_log, "Error extending device %s", filename);
-
-	return rc;
-}
-
-int srb_device_destroy(const char *filename)
-{
-	srb_debug_t debug;
-	struct srb_cdmi_desc_s *cdmi_desc = NULL;
-	int rc = -EIO;
-	int i;
-	int found = 0;
-
-	SRB_LOG_INFO(srb_log, "srb_device_destroy: destroying volume: %s", filename);
-
-	debug.name = NULL;
-	debug.level = srb_log;
-
-	// Check that there is no device associated to filename
-	spin_lock(&devtab_lock);
-	for (i = 0; i < DEV_MAX; ++i) {
-		if (!device_free_slot(&devtab[i])) {
-			const char *fname = kbasename(
-				devtab[i].thread_cdmi_desc[0]->filename);
-			if (strlen(fname) == strlen(filename) && strncmp(fname, filename, strlen(fname)) == 0) {
-				found = 1;
-				break;
-			}
-		}
-	}
-	spin_unlock(&devtab_lock);
-
-	if (found) {
-		SRB_LOG_ERR(srb_log, "Found a device associated to volume %s", filename);
-		rc = -EBUSY;
-		goto err_out_mod;
-	}
-
-	cdmi_desc = vmalloc(sizeof(struct srb_cdmi_desc_s));
-	if (cdmi_desc == NULL) {
-		SRB_LOG_ERR(srb_log, "Unable to allocate memory for temporary CDMI");
-		rc = -ENOMEM;
-		goto err_out_mod;
-	}
-
-	/* First, setup a cdmi connection then Delete the file. */
-	rc = _srb_server_pick(filename, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_connect(&debug, cdmi_desc);
-	if (rc != 0)
-		goto err_out_alloc;
-
-	rc = srb_cdmi_delete(&debug, cdmi_desc);
-	if (rc != 0)
-		goto err_out_cdmi;
-
-	srb_cdmi_disconnect(&debug, cdmi_desc);
-
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-
-	SRB_LOG_INFO(srb_log, "Destroyed volume %s", filename);
-
-	return rc;
-
-err_out_cdmi:
-	srb_cdmi_disconnect(&debug, cdmi_desc);
-err_out_alloc:
-	if (cdmi_desc)
-		vfree(cdmi_desc);
-err_out_mod:
-	SRB_LOG_ERR(srb_log, "Error destroying volume %s", filename);
 
 	return rc;
 }

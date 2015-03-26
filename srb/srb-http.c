@@ -18,9 +18,8 @@
  *
  */
 
-#include <linux/string.h>
-#include <linux/errno.h>
-
+#include <srb/srb-http.h>
+#include <srb/srb-log.h>
 #include "srb.h"
 
 #define HTTP_VER	"HTTP/1.1"
@@ -108,6 +107,7 @@ int srb_http_get_status(char *buf, int len, enum srb_http_statuscode *code)
 
 	return -1;
 }
+EXPORT_SYMBOL(srb_http_get_status);
 
 
 enum srb_http_statusrange srb_http_get_status_range(enum srb_http_statuscode status)
@@ -127,6 +127,7 @@ enum srb_http_statusrange srb_http_get_status_range(enum srb_http_statuscode sta
 
 	return range;
 }
+EXPORT_SYMBOL(srb_http_get_status_range);
 
 #if 0
 // Add a \0 at the end of the buffer
@@ -176,193 +177,7 @@ int srb_http_check_response_complete(char *buff, int len)
 
 	return hdr_end + contentlen <= len;
 }
-
-int srb_http_mkhead(char *buff, int len, char *host, char *page)
-{
-	char *bufp = buff;
-	int mylen = len;
-	int ret;
-
-	*buff = 0;
-	ret = add_buffer(&bufp, &mylen, "HEAD ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, page);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, " " HTTP_VER CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_KEEPALIVE CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_USER_AGENT CRLF);
-	if (ret)
-		return -ENOMEM;
-	
-	ret = add_buffer(&bufp, &mylen, "Host: ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, host);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	return (len - mylen);
-}
-
-int srb_http_mkcreate(char *buff, int len, char *host, char *page)
-{
-	char *bufp = buff;
-	int mylen = len;
-	int ret;
-
-	*buff = 0;
-	ret = add_buffer(&bufp, &mylen, "PUT ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, page);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, " " HTTP_VER CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_KEEPALIVE CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_USER_AGENT CRLF);
-	if (ret)
-		return -ENOMEM;
-	
-	ret = add_buffer(&bufp, &mylen, "Host: ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, host);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, "If-None-Match: *");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	return (len - mylen);
-}
-
-int srb_http_mktruncate(char *buff, int len, char *host, char *page, unsigned long long size)
-{
-	char *bufp = buff;
-	int mylen = len;
-	char buf[64];
-	int ret;
-
-	*buff = 0;
-	ret = add_buffer(&bufp, &mylen, "PUT ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, page);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, " " HTTP_VER CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_KEEPALIVE CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_USER_AGENT CRLF);
-	if (ret)
-		return -ENOMEM;
-	
-	ret = add_buffer(&bufp, &mylen, "Host: ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, host);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	sprintf(buf, "%s: %llu", HTTP_TRUNCATE, size);
-
-	ret = add_buffer(&bufp, &mylen, buf);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	return (len - mylen);
-}
-
-int srb_http_mkdelete(char *buff, int len, char *host, char *page)
-{
-	char *bufp = buff;
-	int mylen = len;
-	int ret;
-
-	*buff = 0;
-	ret = add_buffer(&bufp, &mylen, "DELETE ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, page);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, " " HTTP_VER CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_KEEPALIVE CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_USER_AGENT CRLF);
-	if (ret)
-		return -ENOMEM;
-	
-	ret = add_buffer(&bufp, &mylen, "Host: ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, host);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	return (len - mylen);
-}
+EXPORT_SYMBOL(srb_http_check_response_complete);
 
 int srb_http_mkmetadata(char *buff, int len, char *host, char *page)
 {
@@ -405,6 +220,7 @@ int srb_http_mkmetadata(char *buff, int len, char *host, char *page)
 
 	return (len - mylen);
 }
+EXPORT_SYMBOL(srb_http_mkmetadata);
 
 int srb_http_mkrange(char *cmd, char *buff, int len, char *host, char *page,
 		uint64_t start, uint64_t end)
@@ -478,67 +294,7 @@ int srb_http_mkrange(char *cmd, char *buff, int len, char *host, char *page,
 
 	return (len - mylen);
 }
-
-int srb_http_mklist(char *buff, int len, char *host, char *page)
-{
-	char *bufp = buff;
-	int mylen = len;
-	int ret;
-
-	*buff = 0;
-	ret = add_buffer(&bufp, &mylen, "GET ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, " ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, page);
-	if (ret)
-		return -ENOMEM;
-
-	if (page[strlen(page) - 1] != '/')
-	{
-		ret = add_buffer(&bufp, &mylen, "/");
-		if (ret)
-			return -ENOMEM;
-	}
-
-	ret = add_buffer(&bufp, &mylen, " " HTTP_VER CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_KEEPALIVE CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, HTTP_USER_AGENT CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, "Host: ");
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, host);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen,  CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen,  HTTP_CDMI_VERS CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	ret = add_buffer(&bufp, &mylen, CRLF);
-	if (ret)
-		return -ENOMEM;
-
-	return (len - mylen);
-}
+EXPORT_SYMBOL(srb_http_mkrange);
 
 int srb_http_header_get_uint64(char *buff, int len, char *key, uint64_t *value)
 {
@@ -594,6 +350,7 @@ int srb_http_header_get_uint64(char *buff, int len, char *key, uint64_t *value)
 
 	return 0;
 }
+EXPORT_SYMBOL(srb_http_header_get_uint64);
 
 int srb_http_skipheader(char **buff, int *len)
 {
@@ -615,3 +372,4 @@ int srb_http_skipheader(char **buff, int *len)
 
 	return -1;
 }
+EXPORT_SYMBOL(srb_http_skipheader);

@@ -20,16 +20,21 @@
  *
  */
 
-#include <linux/module.h>    // included for all kernel modules
-#include <linux/kernel.h>    // included for KERN_INFO
-#include <linux/types.h>     // for uintx_t
-#include <linux/signal.h>
+#include <linux/inet.h>
+#include <linux/net.h>
 #include <linux/sched.h>
-#include <linux/socket.h>
 #include <linux/tcp.h>
+#include <net/sock.h>
+
 #include "srb.h"
 
-#include "jsmn/jsmn.h"
+#include <srb/srb-http.h>
+#include <srb/srb-log.h>
+
+#define SRB_REUSE_LIMIT	100 /* Max number of requests sent to
+				     * a single HTTP connection before
+				     * restarting a new one.
+				     */
 
 /* TODO: add username and password support */
 #define CDMI_DISCONNECTED	0
@@ -103,7 +108,7 @@ static int get_port(const char *url, int *port)
  *
  */
 int srb_cdmi_init(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
+		struct srb_cdmi_desc *desc,
 		const char *url)
 {
 	/*          1    1 */
@@ -116,9 +121,9 @@ int srb_cdmi_init(srb_debug_t *dbg,
 	desc->filename[0] = 0;
 	*ip = 0;
 
-	strncpy(desc->url, url, SRB_URL_SIZE);
+	strncpy(desc->url, url, SRB_CDMI_URL_SIZE);
 
-	desc->url[SRB_URL_SIZE] = 0;
+	desc->url[SRB_CDMI_URL_SIZE] = 0;
 	/* Only 'http://' supported for the moment */
 	if (strncmp(url, PROTO_HTTP, strlen(PROTO_HTTP)))
 		return -EINVAL;
@@ -163,7 +168,7 @@ int srb_cdmi_init(srb_debug_t *dbg,
  * Returns 0 if successfull or a negative value depending the error.
  */
 int srb_cdmi_connect(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc)
+		struct srb_cdmi_desc *desc)
 {
 	int ret;
 	int arg = 1;
@@ -239,7 +244,7 @@ out_error:
  *
  */
 int srb_cdmi_disconnect(srb_debug_t *dbg,
-			struct srb_cdmi_desc_s *desc)
+			struct srb_cdmi_desc *desc)
 {
 	if (!desc)
 		return -EINVAL;
@@ -259,7 +264,7 @@ int srb_cdmi_disconnect(srb_debug_t *dbg,
  *  Send or receive packet.
  */
 static int sock_xmit(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
+		struct srb_cdmi_desc *desc,
 		int send,
 		void *buf, int size,
 		int strict_receive)
@@ -334,7 +339,7 @@ static int sock_xmit(srb_debug_t *dbg,
 }
 
 static int sock_send_receive(srb_debug_t *dbg,
-			struct srb_cdmi_desc_s *desc,
+			struct srb_cdmi_desc *desc,
 			int send_size, int rcv_size)
 {
 	char *buff = desc->xmit_buff;
@@ -346,7 +351,7 @@ static int sock_send_receive(srb_debug_t *dbg,
 
 	if (rcv_size == 0) {
 		strict_rcv = 0;
-		rcv_size = SRB_XMIT_BUFFER_SIZE;
+		rcv_size = SRB_CDMI_XMIT_BUFFER_SIZE;
 	}
 	rcvbuf = vmalloc(rcv_size);
 	if (rcvbuf == NULL) {
@@ -432,7 +437,7 @@ cleanup:
 }
 
 static int sock_send_sglist_receive(srb_debug_t *dbg,
-				struct srb_cdmi_desc_s *desc,
+				struct srb_cdmi_desc *desc,
 				int send_size, int rcv_size)
 {
 	char *buff = desc->xmit_buff;
@@ -445,7 +450,7 @@ static int sock_send_sglist_receive(srb_debug_t *dbg,
 
 	if (rcv_size == 0) {
 		strict_rcv = 0;
-		rcv_size = SRB_XMIT_BUFFER_SIZE;
+		rcv_size = SRB_CDMI_XMIT_BUFFER_SIZE;
 	}
 	rcvbuf = vmalloc(rcv_size);
 	if (rcvbuf == NULL) {
@@ -558,7 +563,7 @@ cleanup:
 }
 
 static int retried_send_receive(srb_debug_t *dbg,
-				struct srb_cdmi_desc_s *desc,
+				struct srb_cdmi_desc *desc,
 				int send_size, int rcv_size,
 				int do_sglist, int attempts)
 {
@@ -593,381 +598,6 @@ static int retried_send_receive(srb_debug_t *dbg,
 	return ret;
 }
 
-int srb_cdmi_list(srb_debug_t *dbg,
-		   struct srb_cdmi_desc_s *desc,
-		   int (*volume_cb)(void * data, const char *),
-		   void *cb_data)
-{
-	jsmn_parser	json_parser;
-	jsmntok_t	*json_tokens = NULL, *json_tokens2 = NULL;
-	unsigned int	n_tokens = 0;
-	jsmnerr_t	json_err = JSMN_ERROR_NOMEM;
-
-	char filename[SRB_URL_SIZE+1];
-	char *buff = desc->xmit_buff;
-
-	enum srb_http_statuscode code;
-	char *content = NULL;
-	uint64_t contentlen;
-
-	int len;
-	int ret;
-	int array, obj, found;
-	int cb_errcount = 0;
-
-	if (!desc->socket)
-		return 0;
-
-	// Construct HTTTP GET (for listing container)
-	len = srb_http_mklist(buff, SRB_XMIT_BUFFER_SIZE,
-			       desc->ip_addr, desc->filename);
-	if (len <= 0) return len;
-
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	// Check response status
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret == -1)
-	{
-		SRB_LOG_ERR(dbg->level, "[list] Cannot retrieve response status");
-		ret = -EIO;
-		goto err;
-	}
-	if (code != SRB_HTTP_STATUS_OK)
-	{
-		SRB_LOG_ERR(dbg->level, "[list] Server listing yielded "
-			   "response status %i", code);
-		ret = -EIO;
-		goto err;
-	}
-
-	// Get content length
-	ret = srb_http_header_get_uint64(buff, len,
-					  "Content-Length", &contentlen);
-	if (ret)
-	{
-		SRB_LOG_ERR(dbg->level, "[list] Could not find content length in "
-			   "response headers.");
-		ret = -EIO;
-		goto err;
-	}
-
-	content = vmalloc(contentlen);
-	if (content == NULL)
-	{
-		SRB_LOG_ERR(dbg->level, "[list] Cannot allocate enough memory to"
-			   " read volume repository.");
-		ret = -ENOMEM;
-		goto err;
-	}
-	memset(content, 0, contentlen);
-
-	// Skip header
-	ret = srb_http_skipheader(&buff, &len);
-	if (ret) {
-		SRB_LOG_ERR(dbg->level, "[list] skipheader failed: %d", ret);
-		ret = -EIO;
-		goto err;
-	}
-	if (len > contentlen)
-	{
-		SRB_LOG_ERR(dbg->level, "[list] More data left than expected:"
-			   " len=%i > contentlen=%llu", len, contentlen);
-		ret = -EIO;
-		goto err;
-	}
-
-	// Get body
-	// First, copy leftovers from buff
-	memcpy(content, buff, len);
-	if (len != contentlen) {
-		SRB_LOG_ERR(dbg->level, "[list] Cannot read whole listing: "
-		            "len: %d contentlen:%llu", len, contentlen);
-		ret = -EIO;
-		goto err;
-	}
-
-	// Now retrieve the list of objects...
-#define SRB_N_JSON_TOKENS	128
-	jsmn_init(&json_parser);
-	n_tokens = SRB_N_JSON_TOKENS;
-	do
-	{
-		n_tokens *= 2;
-		json_tokens2 = json_tokens;
-		json_tokens = krealloc(json_tokens2,
-				       n_tokens * sizeof(*json_tokens),
-				       GFP_KERNEL);
-		if (json_tokens != NULL)
-		{
-			json_err = jsmn_parse(&json_parser, content, contentlen,
-					      json_tokens, n_tokens);
-		} else {
-			/* krealloc doesn't free the original */
-			kfree(json_tokens2);
-		}
-
-	} while (json_tokens != NULL
-		 && json_err < 0 && json_err == JSMN_ERROR_NOMEM);
-
-	if (json_err < 0)
-	{
-		if (json_tokens == NULL)
-		{
-			SRB_LOG_ERR(dbg->level, "Could not allocate enough memory to "
-				   "parse JSON volume list.");
-			ret = -ENOMEM;
-		}
-		else
-		{
-			SRB_LOG_ERR(dbg->level, "Could not parse Json: error %i", json_err);
-			ret = -EIO;
-		}
-		goto err;
-	}
-
-	// Find the "children" object within json root object
-	// for each sub-loop, ret (aka tmp iterator) is intialized to 1
-	// in order to start after the object/array token it iterates within.
-	found = 0;
-	for (ret = 0; ret < json_err; ret ++)
-	{
-		jsmntok_t   *objtok = &json_tokens[ret];
-		// Dive into root object
-		if (objtok->parent == -1 && objtok->type == JSMN_OBJECT)
-		{
-			obj = ret;
-			for (ret = 1; obj+ret < json_err; ret += 2)
-			{
-				jsmntok_t   *artok = &json_tokens[obj+ret];
-				// Dive into key 'children' (should contain an array)
-				if (artok->type == JSMN_STRING
-				    && strncmp("children", &content[artok->start],
-					       artok->end - artok->start) == 0
-				    && obj+ret < json_err
-				    && json_tokens[obj+ret+1].type == JSMN_ARRAY)
-				{
-					array = obj + ret + 1;
-					SRB_LOG_DEBUG(dbg->level, "Found children list:");
-					// List children of the array we found.
-					for (ret = 1;
-					     array + ret < json_err
-					     && json_tokens[array+ret].parent == array
-					     && ret < DEV_MAX;
-					     ++ret)
-					{
-						len = json_tokens[array+ret].end
-							- json_tokens[array+ret].start;
-						SRB_LOG_DEBUG(dbg->level, "Volume %i: %.*s", ret, len,
-							   &content[json_tokens[array+ret].start]);
-						strncpy(filename,
-							&content[json_tokens[array+ret].start],
-							SRB_MIN(SRB_URL_SIZE, len));
-						filename[SRB_MIN(SRB_URL_SIZE, len)] = 0;
-
-						if (volume_cb(cb_data, filename) != 0) {
-							cb_errcount += 1;
-						}
-					}
-					found = 1;
-					break ;
-				}
-			}
-			if (found)
-				break ;
-		}
-	}
-
-	ret = 0;
-	if (cb_errcount != 0)
-		ret = -EIO;
-
-err:
-	if (json_tokens)
-		kfree(json_tokens);
-	if (content)
-		vfree(content);
-
-	return ret;
-}
-
-int srb_cdmi_flush(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
-		unsigned long flush_size)
-{
-	char *buff = desc->xmit_buff;
-	uint64_t size;
-	int len;
-	int ret;
-	enum srb_http_statuscode code;
-
-	if (!desc->socket)
-		return 0;
-
-	/* Construct HTTP truncate */
-	len = srb_http_mktruncate(buff, SRB_XMIT_BUFFER_SIZE,
-				desc->ip_addr, desc->filename, flush_size);
-	if (len <= 0) return len;
-	
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret != 0)
-	{
-		SRB_LOG_ERR(dbg->level, "Cannot get http response status.");
-		return -EIO;
-	}
-	if (srb_http_get_status_range(code) != SRB_HTTP_STATUSRANGE_SUCCESS)
-	{
-		SRB_LOG_ERR(dbg->level, "Http server responded with bad status: %i", code);
-		if (code == SRB_HTTP_STATUS_NOT_FOUND)
-			return -ENODEV;
-		return -EIO;
-	}
-
-	buff[len] = 0;
-	ret = srb_http_header_get_uint64(buff, len, "Content-Length", &size);
-	if (ret)
-		return -EIO;
-
-	return 0;
-}
-
-int srb_cdmi_extend(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
-		unsigned long long trunc_size)
-{
-	char *buff = desc->xmit_buff;
-	unsigned long long cur_size = 0;
-	int len;
-	int ret;
-	enum srb_http_statuscode code;
-
-	if (!desc || !desc->socket)
-		return -EINVAL;
-
-	ret = srb_cdmi_getsize(dbg, desc, &cur_size);
-	if (ret != 0) {
-		SRB_LOG_ERR(dbg->level, "[extend] Could not get size of existing volume.");
-		return ret;
-	}
-
-	if (cur_size >= trunc_size) {
-		SRB_LOG_ERR(dbg->level, "[extend] Cannot shrink a volume.");
-		return -EINVAL;
-	}
-
-	/* Construct/send HTTP truncate */
-	len = srb_http_mktruncate(buff, SRB_XMIT_BUFFER_SIZE,
-				   desc->ip_addr, desc->filename, trunc_size);
-	if (len <= 0) return len;
-
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret == -1) {
-		SRB_LOG_ERR(dbg->level, "[extend] Cannot retrieve response status");
-		return -EIO;
-	}
-
-	if (srb_http_get_status_range(code) != SRB_HTTP_STATUSRANGE_SUCCESS) {
-		SRB_LOG_ERR(dbg->level, "[extend] Status of extend operation = %i.", code);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-int srb_cdmi_create(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
-		unsigned long long trunc_size)
-{
-	char *buff = desc->xmit_buff;
-	int len;
-	int ret;
-	enum srb_http_statuscode code;
-
-	if (!desc || !desc->socket)
-		return -EINVAL;
-
-	/* Construct/send HTTP create */
-	len = srb_http_mkcreate(buff, SRB_XMIT_BUFFER_SIZE,
-				 desc->ip_addr, desc->filename);
-	if (len <= 0) return len;
-
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret == -1) {
-		SRB_LOG_ERR(dbg->level, "[create] Cannot retrieve response status from %.*s", 32, buff);
-		return -EIO;
-	}
-
-	if (srb_http_get_status_range(code) != SRB_HTTP_STATUSRANGE_SUCCESS) {
-		SRB_LOG_ERR(dbg->level, "[create] Status of create operation = %i.", code);
-		return -EIO;
-	}
-
-	/* Construct/send HTTP truncate */
-	len = srb_http_mktruncate(buff, SRB_XMIT_BUFFER_SIZE,
-				   desc->ip_addr, desc->filename, trunc_size);
-	if (len <= 0) return len;
-
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret == -1) {
-		SRB_LOG_ERR(dbg->level, "[create-trunc] Cannot retrieve response status");
-		return -EIO;
-	}
-
-	if (srb_http_get_status_range(code) != SRB_HTTP_STATUSRANGE_SUCCESS) {
-		SRB_LOG_ERR(dbg->level, "[create-trunc] Status of create operation = %i.", code);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-int srb_cdmi_delete(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc)
-{
-	char *buff = desc->xmit_buff;
-	int len;
-	int ret;
-	enum srb_http_statuscode code;
-
-	if (!desc || !desc->socket)
-		return -EINVAL;
-
-	/* Construct HTTP delete */
-	len = srb_http_mkdelete(buff, SRB_XMIT_BUFFER_SIZE,
-				desc->ip_addr, desc->filename);
-	if (len <= 0) return len;
-	
-	len = sock_send_receive(dbg, desc, len, 0);
-	if (len < 0) return len;
-
-	ret = srb_http_get_status(buff, len, &code);
-	if (ret == -1) {
-		SRB_LOG_ERR(dbg->level, "[destroy] Cannot retrieve response status");
-		return -EIO;
-	}
-
-	if (srb_http_get_status_range(code) != SRB_HTTP_STATUSRANGE_SUCCESS) {
-		SRB_LOG_ERR(dbg->level, "[destroy] Status of delete operation = %i.", code);
-		if (code == SRB_HTTP_STATUS_NOT_FOUND)
-			return -ENOENT;
-		return -EIO;
-	}
-
-	return 0;
-}
-
 /* HACK: due to a bug in HTTP HEAD from scality,using metadata instead */
 #if 0
 int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc,
@@ -994,7 +624,7 @@ int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc,
 }
 #endif
 
-int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc,
+int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc *desc,
 		uint64_t *size)
 {
 	char *buff = desc->xmit_buff;
@@ -1003,7 +633,7 @@ int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc,
 	int ret, len;
 
 	/* Construct a GET (?metadata) command */
-	len = srb_http_mkmetadata(buff, SRB_XMIT_BUFFER_SIZE,
+	len = srb_http_mkmetadata(buff, SRB_CDMI_XMIT_BUFFER_SIZE,
 			desc->ip_addr, desc->filename);
 	if (len <= 0) return len;
 
@@ -1037,7 +667,7 @@ int srb_cdmi_getsize(srb_debug_t *dbg, struct srb_cdmi_desc_s *desc,
  * at specified "offset" writing "size" bytes from "buff".
  */
 int srb_cdmi_putrange(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
+		struct srb_cdmi_desc *desc,
 		uint64_t offset, int size)
 {
 	char *xmit_buff = desc->xmit_buff;
@@ -1051,7 +681,7 @@ int srb_cdmi_putrange(srb_debug_t *dbg,
 	end   = offset + size - 1;
 
 	/* Construct a PUT request with range info */
-	ret = srb_http_mkrange("PUT", xmit_buff, SRB_XMIT_BUFFER_SIZE,
+	ret = srb_http_mkrange("PUT", xmit_buff, SRB_CDMI_XMIT_BUFFER_SIZE,
 				desc->ip_addr, desc->filename,
 				start, end);
 	if (ret <= 0) return ret;
@@ -1082,7 +712,7 @@ out:
  * at specified "offset" reading "size" bytes from "buff".
  */
 int srb_cdmi_getrange(srb_debug_t *dbg,
-		struct srb_cdmi_desc_s *desc,
+		struct srb_cdmi_desc *desc,
 		uint64_t offset, int size)
 {
 	char *xmit_buff = desc->xmit_buff;
@@ -1096,7 +726,7 @@ int srb_cdmi_getrange(srb_debug_t *dbg,
 	end   = offset + size - 1;
 
 	/* Construct a PUT request with range info */
-	len = srb_http_mkrange("GET", xmit_buff, SRB_XMIT_BUFFER_SIZE,
+	len = srb_http_mkrange("GET", xmit_buff, SRB_CDMI_XMIT_BUFFER_SIZE,
 				desc->ip_addr, desc->filename,
 				start, end);
 	if (len <= 0)
